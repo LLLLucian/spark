@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql
 
-import java.io.File
+import java.io.{ByteArrayOutputStream, File}
 import java.nio.charset.StandardCharsets
 import java.sql.{Date, Timestamp}
 import java.util.UUID
@@ -135,6 +135,25 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
     checkAnswer(
       structDf.select(hash($"a", $"*")),
       structDf.select(hash($"a", $"record.*")))
+  }
+
+  test("Star Expansion - xxhash64") {
+    val structDf = testData2.select("a", "b").as("record")
+    checkAnswer(
+      structDf.groupBy($"a", $"b").agg(min(xxhash64($"a", $"*"))),
+      structDf.groupBy($"a", $"b").agg(min(xxhash64($"a", $"a", $"b"))))
+
+    checkAnswer(
+      structDf.groupBy($"a", $"b").agg(xxhash64($"a", $"*")),
+      structDf.groupBy($"a", $"b").agg(xxhash64($"a", $"a", $"b")))
+
+    checkAnswer(
+      structDf.select(xxhash64($"*")),
+      structDf.select(xxhash64($"record.*")))
+
+    checkAnswer(
+      structDf.select(xxhash64($"a", $"*")),
+      structDf.select(xxhash64($"a", $"record.*")))
   }
 
   test("Star Expansion - explode should fail with a meaningful message if it takes a star") {
@@ -743,22 +762,26 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
   }
 
   test("inputFiles") {
-    withTempDir { dir =>
-      val df = Seq((1, 22)).toDF("a", "b")
+    Seq("csv", "").foreach { useV1List =>
+      withSQLConf(SQLConf.USE_V1_SOURCE_READER_LIST.key -> useV1List) {
+        withTempDir { dir =>
+          val df = Seq((1, 22)).toDF("a", "b")
 
-      val parquetDir = new File(dir, "parquet").getCanonicalPath
-      df.write.parquet(parquetDir)
-      val parquetDF = spark.read.parquet(parquetDir)
-      assert(parquetDF.inputFiles.nonEmpty)
+          val parquetDir = new File(dir, "parquet").getCanonicalPath
+          df.write.parquet(parquetDir)
+          val parquetDF = spark.read.parquet(parquetDir)
+          assert(parquetDF.inputFiles.nonEmpty)
 
-      val jsonDir = new File(dir, "json").getCanonicalPath
-      df.write.json(jsonDir)
-      val jsonDF = spark.read.json(jsonDir)
-      assert(parquetDF.inputFiles.nonEmpty)
+          val csvDir = new File(dir, "csv").getCanonicalPath
+          df.write.json(csvDir)
+          val csvDF = spark.read.json(csvDir)
+          assert(csvDF.inputFiles.nonEmpty)
 
-      val unioned = jsonDF.union(parquetDF).inputFiles.sorted
-      val allFiles = (jsonDF.inputFiles ++ parquetDF.inputFiles).distinct.sorted
-      assert(unioned === allFiles)
+          val unioned = csvDF.union(parquetDF).inputFiles.sorted
+          val allFiles = (csvDF.inputFiles ++ parquetDF.inputFiles).distinct.sorted
+          assert(unioned === allFiles)
+        }
+      }
     }
   }
 
@@ -1398,11 +1421,14 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
   }
 
   test("SPARK-10316: respect non-deterministic expressions in PhysicalOperation") {
-    val input = spark.read.json((1 to 10).map(i => s"""{"id": $i}""").toDS())
+    withTempDir { dir =>
+      (1 to 10).toDF("id").write.mode(SaveMode.Overwrite).json(dir.getCanonicalPath)
+      val input = spark.read.json(dir.getCanonicalPath)
 
-    val df = input.select($"id", rand(0).as('r))
-    df.as("a").join(df.filter($"r" < 0.5).as("b"), $"a.id" === $"b.id").collect().foreach { row =>
-      assert(row.getDouble(1) - row.getDouble(3) === 0.0 +- 0.001)
+      val df = input.select($"id", rand(0).as('r))
+      df.as("a").join(df.filter($"r" < 0.5).as("b"), $"a.id" === $"b.id").collect().foreach { row =>
+        assert(row.getDouble(1) - row.getDouble(3) === 0.0 +- 0.001)
+      }
     }
   }
 
@@ -1550,8 +1576,8 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
       val rdd = sparkContext.makeRDD(Seq(Row(1, 3), Row(2, 1)))
       val df = spark.createDataFrame(
         rdd,
-        new StructType().add("f1", IntegerType).add("f2", IntegerType),
-        needsConversion = false).select($"F1", $"f2".as("f2"))
+        new StructType().add("f1", IntegerType).add("f2", IntegerType))
+        .select($"F1", $"f2".as("f2"))
       val df1 = df.as("a")
       val df2 = df.as("b")
       checkAnswer(df1.join(df2, $"a.f2" === $"b.f2"), Row(1, 3, 1, 3) :: Row(2, 1, 2, 1) :: Nil)
@@ -1752,7 +1778,7 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
     val size = 201L
     val rdd = sparkContext.makeRDD(Seq(Row.fromSeq(Seq.range(0, size))))
     val schemas = List.range(0, size).map(a => StructField("name" + a, LongType, true))
-    val df = spark.createDataFrame(rdd, StructType(schemas), false)
+    val df = spark.createDataFrame(rdd, StructType(schemas))
     assert(df.persist.take(1).apply(0).toSeq(100).asInstanceOf[Long] == 100)
   }
 
@@ -2105,6 +2131,23 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
           |  LEFT OUTER JOIN v ON v.id = a.id
         """.stripMargin)
       checkAnswer(res, Row("1-1", 6, 6))
+    }
+  }
+
+  test("SPARK-27439: Explain result should match collected result after view change") {
+    withTempView("test", "test2", "tmp") {
+      spark.range(10).createOrReplaceTempView("test")
+      spark.range(5).createOrReplaceTempView("test2")
+      spark.sql("select * from test").createOrReplaceTempView("tmp")
+      val df = spark.sql("select * from tmp")
+      spark.sql("select * from test2").createOrReplaceTempView("tmp")
+
+      val captured = new ByteArrayOutputStream()
+      Console.withOut(captured) {
+        df.explain()
+      }
+      checkAnswer(df, spark.range(10).toDF)
+      assert(captured.toString().contains("Range (0, 10, step=1, splits=2)"))
     }
   }
 }
