@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,7 +17,6 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
 import itertools
 from argparse import ArgumentParser
 import os
@@ -44,15 +43,20 @@ def determine_modules_for_files(filenames):
     """
     Given a list of filenames, return the set of modules that contain those files.
     If a file is not associated with a more specific submodule, then this method will consider that
-    file to belong to the 'root' module.
+    file to belong to the 'root' module. GitHub Action and Appveyor files are ignored.
 
     >>> sorted(x.name for x in determine_modules_for_files(["python/pyspark/a.py", "sql/core/foo"]))
     ['pyspark-core', 'sql']
     >>> [x.name for x in determine_modules_for_files(["file_not_matched_by_any_subproject"])]
     ['root']
+    >>> [x.name for x in determine_modules_for_files( \
+            [".github/workflows/master.yml", "appveyor.yml"])]
+    []
     """
     changed_modules = set()
     for filename in filenames:
+        if filename in (".github/workflows/master.yml", "appveyor.yml"):
+            continue
         matched_at_least_one_module = False
         for module in modules.all_modules:
             if module.contains_file(filename):
@@ -240,7 +244,7 @@ def exec_maven(mvn_args=()):
     zinc_port = get_zinc_port()
     os.environ["ZINC_PORT"] = "%s" % zinc_port
     zinc_flag = "-DzincPort=%s" % zinc_port
-    flags = [os.path.join(SPARK_HOME, "build", "mvn"), "--force", zinc_flag]
+    flags = [os.path.join(SPARK_HOME, "build", "mvn"), zinc_flag]
     run_cmd(flags + mvn_args)
 
 
@@ -265,7 +269,7 @@ def exec_sbt(sbt_args=()):
     echo_proc.wait()
     for line in iter(sbt_proc.stdout.readline, b''):
         if not sbt_output_filter.match(line):
-            print(line, end='')
+            print(line.decode('utf-8'), end='')
     retcode = sbt_proc.wait()
 
     if retcode != 0:
@@ -279,8 +283,8 @@ def get_hadoop_profiles(hadoop_version):
     """
 
     sbt_maven_hadoop_profiles = {
-        "hadoop2.7": ["-Phadoop-2.7"],
-        "hadoop3.2": ["-Phadoop-3.2"],
+        "hadoop2.7": ["-Phadoop-2.7", "-Phive-1.2"],
+        "hadoop3.2": ["-Phadoop-3.2", "-Phive-2.3"],
     }
 
     if hadoop_version in sbt_maven_hadoop_profiles:
@@ -404,6 +408,13 @@ def run_scala_tests(build_tool, hadoop_version, test_modules, excluded_tags):
     if excluded_tags:
         test_profiles += ['-Dtest.exclude.tags=' + ",".join(excluded_tags)]
 
+    # set up java11 env if this is a pull request build with 'test-java11' in the title
+    if "ghprbPullTitle" in os.environ:
+        if "test-java11" in os.environ["ghprbPullTitle"].lower():
+            os.environ["JAVA_HOME"] = "/usr/java/jdk-11.0.1"
+            os.environ["PATH"] = "%s/bin:%s" % (os.environ["JAVA_HOME"], os.environ["PATH"])
+            test_profiles += ['-Djava.version=11']
+
     if build_tool == "maven":
         run_scala_tests_maven(test_profiles)
     else:
@@ -469,6 +480,8 @@ def post_python_tests_results():
         run_cmd(["git", "push", "-f", "origin", "gh-pages"])
     finally:
         os.chdir("..")
+        # 10. Remove the cloned repository.
+        shutil.rmtree("pyspark-coverage-site")
 
 
 def run_python_packaging_tests():
@@ -563,6 +576,7 @@ def main():
         changed_files = identify_changed_files_from_git_commits("HEAD", target_branch=target_branch)
         changed_modules = determine_modules_for_files(changed_files)
         excluded_tags = determine_tags_to_exclude(changed_modules)
+
     if not changed_modules:
         changed_modules = [modules.root]
         excluded_tags = []

@@ -56,7 +56,7 @@ object PhysicalOperation extends PredicateHelper {
    * }}}
    */
   private def collectProjectsAndFilters(plan: LogicalPlan):
-      (Option[Seq[NamedExpression]], Seq[Expression], LogicalPlan, Map[Attribute, Expression]) =
+      (Option[Seq[NamedExpression]], Seq[Expression], LogicalPlan, AttributeMap[Expression]) =
     plan match {
       case Project(fields, child) if fields.forall(_.deterministic) =>
         val (_, filters, other, aliases) = collectProjectsAndFilters(child)
@@ -72,14 +72,15 @@ object PhysicalOperation extends PredicateHelper {
         collectProjectsAndFilters(h.child)
 
       case other =>
-        (None, Nil, other, Map.empty)
+        (None, Nil, other, AttributeMap(Seq()))
     }
 
-  private def collectAliases(fields: Seq[Expression]): Map[Attribute, Expression] = fields.collect {
-    case a @ Alias(child, _) => a.toAttribute -> child
-  }.toMap
+  private def collectAliases(fields: Seq[Expression]): AttributeMap[Expression] =
+    AttributeMap(fields.collect {
+      case a: Alias => (a.toAttribute, a.child)
+    })
 
-  private def substitute(aliases: Map[Attribute, Expression])(expr: Expression): Expression = {
+  private def substitute(aliases: AttributeMap[Expression])(expr: Expression): Expression = {
     expr.transform {
       case a @ Alias(ref: AttributeReference, name) =>
         aliases.get(ref)
@@ -118,19 +119,23 @@ object ExtractEquiJoinKeys extends Logging with PredicateHelper {
         // Replace null with default value for joining key, then those rows with null in it could
         // be joined together
         case EqualNullSafe(l, r) if canEvaluate(l, left) && canEvaluate(r, right) =>
-          Some((Coalesce(Seq(l, Literal.default(l.dataType))),
-            Coalesce(Seq(r, Literal.default(r.dataType)))))
+          Seq((Coalesce(Seq(l, Literal.default(l.dataType))),
+            Coalesce(Seq(r, Literal.default(r.dataType)))),
+            (IsNull(l), IsNull(r))
+          )
         case EqualNullSafe(l, r) if canEvaluate(l, right) && canEvaluate(r, left) =>
-          Some((Coalesce(Seq(r, Literal.default(r.dataType))),
-            Coalesce(Seq(l, Literal.default(l.dataType)))))
+          Seq((Coalesce(Seq(r, Literal.default(r.dataType))),
+            Coalesce(Seq(l, Literal.default(l.dataType)))),
+            (IsNull(r), IsNull(l))
+          )
         case other => None
       }
       val otherPredicates = predicates.filterNot {
         case EqualTo(l, r) if l.references.isEmpty || r.references.isEmpty => false
-        case EqualTo(l, r) =>
+        case Equality(l, r) =>
           canEvaluate(l, left) && canEvaluate(r, right) ||
             canEvaluate(l, right) && canEvaluate(r, left)
-        case other => false
+        case _ => false
       }
 
       if (joinKeys.nonEmpty) {

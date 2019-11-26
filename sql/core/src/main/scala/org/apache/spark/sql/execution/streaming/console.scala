@@ -22,11 +22,11 @@ import java.util
 import scala.collection.JavaConverters._
 
 import org.apache.spark.sql._
+import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table, TableCapability, TableProvider}
+import org.apache.spark.sql.connector.write.{SupportsTruncate, WriteBuilder}
+import org.apache.spark.sql.connector.write.streaming.StreamingWrite
 import org.apache.spark.sql.execution.streaming.sources.ConsoleWrite
 import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceRegister}
-import org.apache.spark.sql.sources.v2._
-import org.apache.spark.sql.sources.v2.writer.{SupportsTruncate, WriteBuilder}
-import org.apache.spark.sql.sources.v2.writer.streaming.StreamingWrite
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -61,7 +61,7 @@ class ConsoleSinkProvider extends TableProvider
   def shortName(): String = "console"
 }
 
-object ConsoleTable extends Table with SupportsWrite with BaseStreamingSink {
+object ConsoleTable extends Table with SupportsWrite {
 
   override def name(): String = "console"
 
